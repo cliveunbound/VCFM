@@ -1569,7 +1569,10 @@ export class SimEngine {
       } catch (err) {
         // A broken host must not stall the match.
         this._resolverNotified = false;
-        this.resolveShotOutcome(this.random() < this._pendingSave?.pSave);
+        const fallback = this._pendingPenalty
+          ? 1 - this._pendingPenalty.pScore
+          : this._pendingSave?.pSave;
+        this.resolveShotOutcome(this.random() < fallback);
       }
     }
   }
@@ -5060,6 +5063,7 @@ export class SimEngine {
     this._shotResolver = typeof fn === "function" ? fn : null;
     this._humanTeam = humanTeam === "away" ? "away" : "home";
     this._pendingSave = null;
+    this._pendingPenalty = null;
     this._awaitingResolution = false;
     this._resolverNotified = false;
   }
@@ -5075,6 +5079,37 @@ export class SimEngine {
    * engine would have rolled against, for a host that wants to defer to it.
    */
   pendingShotInfo() {
+    const pen = this._pendingPenalty;
+    if (pen) {
+      const gkTeam = pen.oppTeam;
+      // The engine rolled goal / save / miss when the kick was awarded. A miss
+      // is the taker's doing, not the keeper's, so it survives the host's
+      // verdict exactly as a wide shot does in open play -- and onTarget says
+      // so, the same field, with the same meaning.
+      const onTarget = pen.outcome !== "miss";
+      const pMiss = (1 - pen.pScore) * 0.3;
+      return {
+        kind: gkTeam === this._humanTeam ? "shot" : "chance",
+        penalty: true,
+        shooterTeam: pen.team,
+        keeperId: pen.gkId,
+        distance: 11,
+        x: 50,
+        y: pen.spotY,
+        pressure: null,
+        openGoal: false,
+        targetX: pen.targetX,
+        targetZ: null,
+        onTarget,
+        flightTime: Math.max(0.01, pen.resolveAt - pen.kickAt),
+        speed: null,
+        // The chance the engine would have kept it out, given it is on target.
+        engineSaveChance: onTarget
+          ? clamp((1 - pen.pScore - pMiss) / Math.max(1e-6, 1 - pMiss), 0, 1)
+          : 0,
+        second: this.t,
+      };
+    }
     const p = this._pendingSave;
     if (!p) return null;
     const meta = this.ball._hostShotMeta || {};
@@ -5113,6 +5148,21 @@ export class SimEngine {
    * a host that answers twice or answers nonsense cannot wedge the match.
    */
   resolveShotOutcome(saved) {
+    const pen = this._pendingPenalty;
+    if (pen) {
+      this._pendingPenalty = null;
+      this._awaitingResolution = false;
+      this._resolverNotified = false;
+      // A skied penalty stays skied whatever the keeper does; otherwise the
+      // host's verdict is the outcome. targetX and the dive are rewritten to
+      // agree with it, so the animation shows what the host was told happened.
+      if (pen.outcome !== "miss") {
+        pen.outcome = saved ? "save" : "goal";
+        pen.targetX = clamp(pen.targetX, SIM.GOAL_X0 + 0.8, SIM.GOAL_X1 - 0.8);
+        pen.saveSide = saved ? (pen.targetX >= 50 ? 1 : -1) : 0;
+      }
+      return true;
+    }
     const p = this._pendingSave;
     this._pendingSave = null;
     this._awaitingResolution = false;
@@ -6284,6 +6334,7 @@ export class SimEngine {
       outcome,
       targetX,
       saveSide,
+      pScore, // 供外部裁决方参考的引擎自身赔率
       phase: "setup",
       // placed 就是这次摆位涉及的场上球员（不含主罚者和两位门将），
       // _tickPenalty 的 setup 阶段用它把这些人钉住不动。
@@ -6353,6 +6404,18 @@ export class SimEngine {
           });
         }
         b.state = "shot";
+
+        // ---- external shot resolution ------------------------------------
+        // A penalty never reaches the open-play save roll: the outcome is
+        // chosen when the kick is awarded and the whole animation is
+        // choreographed to it. So the freeze goes here, on the tick the ball is
+        // struck, and resolvePenaltyOutcome() rewrites the outcome before the
+        // flight is drawn. The ball is on the spot and motionless, so nothing
+        // needs parking. phase is already "flight", so resuming cannot re-ask.
+        if (this._shotResolver && !this._pendingSave && !this._pendingPenalty) {
+          this._pendingPenalty = pen;
+          this._awaitingResolution = true;
+        }
       }
       return;
     }
