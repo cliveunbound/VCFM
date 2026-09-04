@@ -1551,11 +1551,27 @@ export class SimEngine {
   }
 
   step(dt = SIM.DT) {
+    // A shot is frozen awaiting the host's verdict; time does not move.
+    if (this._awaitingResolution) return;
     const requestedDt = clamp(Number(dt) || SIM.DT, 1e-6, 0.5);
     const stats = this.integrationStats;
     stats.outerSteps++;
     stats.coarseSteps++;
     this._stepOnce(requestedDt);
+    // Notify after the step, never from inside it, so host code never runs
+    // half-way through a tick. A host that answers immediately from the
+    // callback still lands before the next step, i.e. exactly where the
+    // engine's own roll would have.
+    if (this._awaitingResolution && !this._resolverNotified) {
+      this._resolverNotified = true;
+      try {
+        this._shotResolver(this.pendingShotInfo());
+      } catch (err) {
+        // A broken host must not stall the match.
+        this._resolverNotified = false;
+        this.resolveShotOutcome(this.random() < this._pendingSave?.pSave);
+      }
+    }
   }
 
   _stepOnce(dt) {
@@ -3244,7 +3260,7 @@ export class SimEngine {
     a.controlUntil = this.t;
     a.bodyTargetHeading = Math.atan2(goalY - a.y, 50 - a.x);
     a.fsm = "home";
-    this._emit("shot", a, {
+    const shotMeta = {
       long: !!long,
       role: a.role,
       assistId,
@@ -3262,7 +3278,11 @@ export class SimEngine {
       targetZ,
       flightTime,
       ...(extraMeta || {}),
-    });
+    };
+    // A host resolving shots itself reads this off the ball when the save roll
+    // freezes; it is the same payload the "shot" event carries.
+    b._hostShotMeta = shotMeta;
+    this._emit("shot", a, shotMeta);
     a.noReclaimUntil = this.t + 0.4;
   }
 
@@ -5017,6 +5037,160 @@ export class SimEngine {
     this._restart(EDGE_RESTART_TYPES.INDIRECT_FREE_KICK, restartTeam, x, y);
   }
 
+  /**
+   * Apply the outcome of one goalkeeper save roll.
+   *
+   * Extracted so the engine and an external resolver share ONE code path --
+   * duplicating it would let the two drift. `saved` is normally the engine's
+   * own roll; when a host has registered a shot resolver it is the host's
+   * verdict instead. Behaviour is otherwise unchanged.
+   */
+  /**
+   * Hand shot outcomes to a host.
+   *
+   *   registerShotResolver(fn, "home")
+   *
+   * `humanTeam` names the side the host is playing. When the save roll comes
+   * up the simulation freezes and `fn(info)` is called; `info.kind` is "shot"
+   * for a strike at the host's own goal and "chance" for one at the far goal.
+   * Nothing advances until resolveShotOutcome() is called. Pass null to hand
+   * the decision back to the engine.
+   */
+  registerShotResolver(fn, humanTeam) {
+    this._shotResolver = typeof fn === "function" ? fn : null;
+    this._humanTeam = humanTeam === "away" ? "away" : "home";
+    this._pendingSave = null;
+    this._awaitingResolution = false;
+    this._resolverNotified = false;
+  }
+
+  /** True while a shot is frozen awaiting the host's verdict. */
+  isAwaitingShotResolution() {
+    return !!this._awaitingResolution;
+  }
+
+  /**
+   * The frozen shot, or null. `kind` "shot" means the host's keeper is facing
+   * it; "chance" means the host's team struck. `engineSaveChance` is what the
+   * engine would have rolled against, for a host that wants to defer to it.
+   */
+  pendingShotInfo() {
+    const p = this._pendingSave;
+    if (!p) return null;
+    const meta = this.ball._hostShotMeta || {};
+    return {
+      kind: p.ctx.gk.team === this._humanTeam ? "shot" : "chance",
+      shooterTeam: p.ctx.gk.team === "home" ? "away" : "home",
+      keeperId: p.ctx.gk.id,
+      distance: Number(this.ball.shotDistance) || meta.distance || null,
+      x: meta.x ?? null,
+      y: meta.y ?? null,
+      pressure: meta.pressure ?? null,
+      openGoal: !!this.ball._openGoalShot,
+      targetX: meta.targetX ?? null,
+      targetZ: meta.targetZ ?? null,
+      // Whether the strike was aimed inside the frame. The save roll also
+      // fires on shots passing near the keeper but heading wide or over, so a
+      // host that only wants real saves should defer the rest to
+      // engineSaveChance rather than prompting on them.
+      onTarget:
+        meta.targetX != null &&
+        meta.targetX > SIM.GOAL_X0 &&
+        meta.targetX < SIM.GOAL_X1 &&
+        (meta.targetZ == null || meta.targetZ < 2.44),
+      flightTime: Number.isFinite(this.ball.shotFlightTime)
+        ? this.ball.shotFlightTime
+        : null,
+      speed: Math.hypot(p.vel.vx, p.vel.vy),
+      engineSaveChance: p.pSave,
+      second: this.t,
+    };
+  }
+
+  /**
+   * The host's verdict: `saved` true = the keeper claims it, false = it beats
+   * them. Returns false if nothing was pending. Resuming is unconditional, so
+   * a host that answers twice or answers nonsense cannot wedge the match.
+   */
+  resolveShotOutcome(saved) {
+    const p = this._pendingSave;
+    this._pendingSave = null;
+    this._awaitingResolution = false;
+    this._resolverNotified = false;
+    if (!p) return false;
+    const b = p.ctx.b;
+    b.vx = p.vel.vx;
+    b.vy = p.vel.vy;
+    b.vz = p.vel.vz;
+    this._applySaveOutcome(p.ctx, !!saved);
+    return true;
+  }
+
+  _applySaveOutcome(ctx, saved) {
+    const { gk, b, cx, cy, lateral, hand, reactionRead, diveDir, dt } = ctx;
+    const speed = Math.hypot(b.vx, b.vy);
+        if (saved) {
+          // 可反应时间越长越容易抱稳；近距离扑救更多托出/击出。
+          const holdP = 0.18 + 0.12 * hand + reactionRead * 0.16;
+          const hold = this.random() < holdP;
+          if (hold) {
+            b.owner = gk.id;
+            b.x = gk.x;
+            b.y = gk.y;
+            b.vx = 0;
+            b.vy = 0;
+            b.z = 0;
+            b.vz = 0;
+            b.state = "held";
+            gk.protectUntil = this.t + 1.8;
+            gk.decisionUntil = this.t + 1.0;
+            b.settleUntil = this.t + 1.15;
+            this.deadBallUntil = this.t + 1.0;
+          } else {
+            // 托出：约 40% 托过底线得角球（现实中门将扑救最主要的角球来源），
+            // 其余弹向边路/角区、不落到前锋脚下。
+            const side = diveDir || (this.random() < 0.5 ? 1 : -1);
+            const bylineDir = gk.team === "home" ? 1 : -1; // 己方底线方向：home 朝 +y(≈100)
+            const tipOverP = clamp(0.8 + Math.max(0, dt - SIM.DT) * 0.4, 0.8, 0.95);
+            const tipOver = this.random() < tipOverP;
+            b.owner = null;
+            b.x = cx;
+            b.y = cy;
+            b.vx = side * (tipOver ? 20 + this.random() * 8 : 10 + this.random() * 8);
+            // tipOver：朝底线外送足够速度越线 → _resolveBounds 判角球给进攻方；
+            // 否则朝场内边路托出，回到运动战。
+            b.vy = tipOver
+              ? bylineDir * (10 + this.random() * 6)
+              : -bylineDir * (6 + this.random() * 5);
+            // 托过横梁必须在过线时高于 2.44；否则门框内的托救会先被判成乌龙，
+            // 永远走不到下方角球分支。
+            b.z = tipOver ? 2.7 + this.random() * 0.5 : 0.6 + this.random() * 0.8;
+            b.vz = tipOver ? 3 + this.random() * 2 : 4 + this.random() * 3;
+            b.state = "loose";
+            b.lastKicker = gk.id;
+            b.kickTeam = gk.team;
+            b.kickX = b.x;
+            b.kickY = b.y;
+            b.settleUntil = this.t + 0.55;
+            this.deadBallUntil = this.t + 0.4;
+            gk.protectUntil = this.t + 0.5;
+            gk.decisionUntil = this.t + 0.55;
+          }
+          this._emit("save", gk, { hold, lateral, openGoal: !!b._openGoalShot });
+          return;
+        }
+        // 未扑住：球继续飞，仅轻微蹭偏（指尖擦到）。
+        // 这里会改变球的飞行方向，但过去不发任何信号，表现层无从知晓，
+        // 画面上就成了「球在无人接触的情况下自己拐弯」。
+        // 加一个只存活一帧的脉冲（与 _netHitPulse 同一套做法），
+        // 让表现层能在擦球点画出接触标记。不改物理、不改判定概率。
+        if (this.random() < 0.18) {
+          b.vx += diveDir * (1.5 + this.random() * 2);
+          b.vy *= 0.96;
+          b._deflectPulse = { x: b.x, y: b.y, byId: gk.id };
+        }
+  }
+
   _resolvePossession(dt) {
     const b = this.ball;
     // 门将轨迹覆盖仍沿用既有画面标尺；控球、抢断和传球拦截统一使用米制。
@@ -5118,66 +5292,29 @@ export class SimEngine {
         gk.poseUntil = this.t + 0.55;
         gk.heading = Math.atan2(cy - gk.y, cx - gk.x);
 
-        if (this.random() < pSave) {
-          // 可反应时间越长越容易抱稳；近距离扑救更多托出/击出。
-          const holdP = 0.18 + 0.12 * hand + reactionRead * 0.16;
-          const hold = this.random() < holdP;
-          if (hold) {
-            b.owner = gk.id;
-            b.x = gk.x;
-            b.y = gk.y;
-            b.vx = 0;
-            b.vy = 0;
-            b.z = 0;
-            b.vz = 0;
-            b.state = "held";
-            gk.protectUntil = this.t + 1.8;
-            gk.decisionUntil = this.t + 1.0;
-            b.settleUntil = this.t + 1.15;
-            this.deadBallUntil = this.t + 1.0;
-          } else {
-            // 托出：约 40% 托过底线得角球（现实中门将扑救最主要的角球来源），
-            // 其余弹向边路/角区、不落到前锋脚下。
-            const side = diveDir || (this.random() < 0.5 ? 1 : -1);
-            const bylineDir = gk.team === "home" ? 1 : -1; // 己方底线方向：home 朝 +y(≈100)
-            const tipOverP = clamp(0.8 + Math.max(0, dt - SIM.DT) * 0.4, 0.8, 0.95);
-            const tipOver = this.random() < tipOverP;
-            b.owner = null;
-            b.x = cx;
-            b.y = cy;
-            b.vx = side * (tipOver ? 20 + this.random() * 8 : 10 + this.random() * 8);
-            // tipOver：朝底线外送足够速度越线 → _resolveBounds 判角球给进攻方；
-            // 否则朝场内边路托出，回到运动战。
-            b.vy = tipOver
-              ? bylineDir * (10 + this.random() * 6)
-              : -bylineDir * (6 + this.random() * 5);
-            // 托过横梁必须在过线时高于 2.44；否则门框内的托救会先被判成乌龙，
-            // 永远走不到下方角球分支。
-            b.z = tipOver ? 2.7 + this.random() * 0.5 : 0.6 + this.random() * 0.8;
-            b.vz = tipOver ? 3 + this.random() * 2 : 4 + this.random() * 3;
-            b.state = "loose";
-            b.lastKicker = gk.id;
-            b.kickTeam = gk.team;
-            b.kickX = b.x;
-            b.kickY = b.y;
-            b.settleUntil = this.t + 0.55;
-            this.deadBallUntil = this.t + 0.4;
-            gk.protectUntil = this.t + 0.5;
-            gk.decisionUntil = this.t + 0.55;
-          }
-          this._emit("save", gk, { hold, lateral, openGoal: !!b._openGoalShot });
-          return;
+        const outcomeCtx = { gk, b, cx, cy, lateral, hand, reactionRead, diveDir, dt };
+
+        // ---- external shot resolution ------------------------------------
+        // A host may take this one decision instead of the engine. Everything
+        // the outcome needs is computed by now, so we stash it, park the ball
+        // and stop. The outcome is applied later by resolveShotOutcome().
+        // The ball must be parked: _resolveBounds runs after this method in the
+        // same step and would otherwise carry a live shot over the goal line
+        // while the host is still thinking.
+        if (this._shotResolver && !this._pendingSave) {
+          this._pendingSave = {
+            ctx: outcomeCtx,
+            vel: { vx: b.vx, vy: b.vy, vz: b.vz },
+            pSave,
+          };
+          b.vx = 0;
+          b.vy = 0;
+          b.vz = 0;
+          this._awaitingResolution = true;
+          break;
         }
-        // 未扑住：球继续飞，仅轻微蹭偏（指尖擦到）。
-        // 这里会改变球的飞行方向，但过去不发任何信号，表现层无从知晓，
-        // 画面上就成了「球在无人接触的情况下自己拐弯」。
-        // 加一个只存活一帧的脉冲（与 _netHitPulse 同一套做法），
-        // 让表现层能在擦球点画出接触标记。不改物理、不改判定概率。
-        if (this.random() < 0.18) {
-          b.vx += diveDir * (1.5 + this.random() * 2);
-          b.vy *= 0.96;
-          b._deflectPulse = { x: b.x, y: b.y, byId: gk.id };
-        }
+
+        this._applySaveOutcome(outcomeCtx, this.random() < pSave);
         break; // 已判定本脚，不再换门将
       }
     }
