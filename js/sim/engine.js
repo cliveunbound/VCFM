@@ -7194,7 +7194,12 @@ export class SimEngine {
       if (a.sentOff) continue; // 已离场者不回基准位（保持走向边线/场外）
       a.x = a.baseX;
       // 常规 baseY 是运动战纵深，前锋已在对方半场；开球时压缩回己方半场。
-      a.y = a.team === "home" ? 50 + a.baseY * 0.48 : a.baseY * 0.48;
+      // 客队必须是主队关于中线的镜像。旧式 `baseY * 0.48` 把客队每个人
+      // 都压深了整整 2 格（2.1m）：主队 y = 50 + baseY*0.48，其镜像应为
+      // 100 - 那个值，即 50 - (100 - baseY)*0.48 = 2 + baseY*0.48。
+      a.y = a.team === "home"
+        ? 50 + a.baseY * 0.48
+        : 50 - (100 - a.baseY) * 0.48;
       // 非开球队必须在球开出前退出中圈（半径约 9.15m）。
       if (a.team !== team) {
         if (a.team === "home") a.y = Math.max(a.y, 59.5);
