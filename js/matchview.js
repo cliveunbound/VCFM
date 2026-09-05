@@ -31,6 +31,11 @@ import {
   assignPlayersToFormationSlots,
 } from "./models.js";
 
+// 球尾特效总开关（2026-09-04 用户反馈「球的尾巴违和，去掉」）。
+// false = 关闭全部尾迹：canvas 地面丝带 + SVG 弧线尾迹（_addTrail/.mp-trails）。
+// 代码全部保留，改回 true 即可找回。canvas 侧的字符串守卫见 _drawBall 附近注释。
+const SHOW_BALL_TRAIL = false;
+
 function clamp(n, a, b) {
   return Math.max(a, Math.min(b, n));
 }
@@ -216,6 +221,7 @@ export class MatchView {
     this.onPlayerClick = null;
     // 镜头：目标与当前（百分比偏移 → CSS translate）
     this.cam = { x: 0, y: 0, tx: 0, ty: 0, scale: 1, tScale: 1 };
+    this._everPlayed = false; // A2 收尾：死球镜头策略在开赛/开赛前分叉（见 _updateCameraTarget）
     this.camBoostUntil = 0;
     this.trails = []; // active trail animations
     this.heatLayer = null;
@@ -1471,6 +1477,7 @@ export class MatchView {
     this._spawnOfficials(actors);
 
     this.cam = { x: 0, y: 0, tx: 0, ty: 0, scale: 1, tScale: 1 };
+    this._everPlayed = false; // A2 收尾：死球镜头策略在开赛/开赛前分叉（见 _updateCameraTarget）
     this.setCameraPreset(this.cameraPreset, { persist: false });
     this._applyCamera();
     this._updatePossessionChrome();
@@ -3283,11 +3290,17 @@ export class MatchView {
     }
 
     // 球轨迹丝带（地面投影）；射门用更醒目的橙黄弧
+    // 2026-09-04：用户反馈球的尾巴特效违和，整体关闭（保留代码，改 SHOW_BALL_TRAIL 即可找回）。
+    // 2026-09-05：SVG 弧线尾迹（_addTrail/.mp-trails）也收进同一个开关（见文件顶部常量）。
+    // 注意：下面那行 `if (!this.carrier && trail.length >= 2)` 是 match-broadcast-audit
+    // 的字符串守卫（「持球时尾迹隐藏」），不要改写它——总开关放在它之前做早返回。
     const trail = this._ballTrail || [];
     const isShotTrail =
       this.ballState === "shot" ||
       (this.fsm.isIn('GOAL_SEQUENCE') && trail.some((p) => (p.z || 0) > 0.8));
-    if (!this.carrier && trail.length >= 2) {
+    // 总开关关闭时整块跳过；开启时下面这行照旧（它是 broadcast-audit 的字符串守卫）。
+    if (!SHOW_BALL_TRAIL) { /* 尾迹已整体关闭，见文件顶部 SHOW_BALL_TRAIL */ }
+    else if (!this.carrier && trail.length >= 2) {
       ctx.save();
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
@@ -3321,7 +3334,9 @@ export class MatchView {
       const x = px(pl.x);
       const y = py(pl.y);
       // 与模拟层 2.85~3.35 的中心间距匹配；旧半径 9px 会让直径大于碰撞距离。
-      const r = clamp(minDim * 0.026, 7, 10);
+      // 2026-09-05（A1）：上限 10→12——列放宽到 640px 后 minDim 变大，12px 半径
+      // 与纵向分离距离的比例和旧 10px/480px 列一致（≈0.65），大屏上球员更可读。
+      const r = clamp(minDim * 0.026, 7, 12);
       const spd = Math.hypot(pl.vx || 0, pl.vy || 0);
       const dim =
         focusOn && !this.focusIds.has(pl.id) && !pl.el.classList.contains("has-ball");
@@ -5437,9 +5452,14 @@ export class MatchView {
    */
   _updateCameraTarget() {
     if (!this.fsm.canAIAct()) {
-      this.cam.tScale = 1;
-      this.cam.tx = 0;
-      this.cam.ty = 0;
+      // 2026-09-05（A2 收尾）：开赛后死球/重启不再回全球场——旧档 scale≈1.03 时
+      // 回中不可察觉，A2 的广播档 1.28 下每次重启都会 zoom 泵 1.28→1.0→1.28。
+      // 球已摆好，镜头原地歇（保持上一目标）。开赛前仍回全球场看阵型。
+      if (!this._everPlayed) {
+        this.cam.tScale = 1;
+        this.cam.tx = 0;
+        this.cam.ty = 0;
+      }
       return;
     }
     // 收尾阶段强制回 wide
@@ -5953,6 +5973,7 @@ export class MatchView {
     // 防止切后台后 dt 爆炸
     const d = Math.min(dt, 0.05);
     const livePlay = this.fsm.canAIAct();
+    if (livePlay) this._everPlayed = true; // 开赛过的标记：死球镜头策略的分叉条件
     const staged = this.fsm.isIn('GOAL_SEQUENCE') && !this.frozen; // 进球/回放：只跟目标
     // scriptLock：关键事件预演，只朝脚本目标跑，不跑自由 AI
     // pre / idle / pause：钉阵型；UI frozen：冻结当前帧
@@ -6315,6 +6336,7 @@ export class MatchView {
    * @param {string} kind goal|shot|save|pass|wood
    */
   _addTrail(x0, y0, x1, y1, kind = "shot", life = 0.7) {
+    if (!SHOW_BALL_TRAIL) return; // 球尾总开关（2026-09-05）：关闭 SVG 弧线尾迹
     if (!this.trailSvg) return;
     // 二次贝塞尔：中点侧偏模拟弧线
     const mx = (x0 + x1) / 2 + (Math.random() - 0.5) * (kind === "pass" ? 4 : 10);
